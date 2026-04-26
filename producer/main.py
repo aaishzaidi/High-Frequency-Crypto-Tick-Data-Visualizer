@@ -1,55 +1,62 @@
 import time
 import random
-from concurrent.futures import ThreadPoolExecutor
+import sys
 from confluent_kafka import Producer
-import tick_pb2  # The dictionary we just generated
+import tick_pb2  # If this fails, it will stop here
 
-# --- CONFIGURATION FOR 1M TICKS/SEC ---
+# --- PERFORMANCE CONFIG ---
 conf = {
-    'bootstrap.servers': 'localhost:9092',
-    'queue.buffering.max.messages': 2000000, # Hold up to 2M messages in RAM
-    'batch.size': 262144,                    # 256KB batches
-    'linger.ms': 5,                          # Wait 5ms to bundle messages
-    'compression.type': 'lz4',               # Fastest compression for CPU
-    'acks': 0                                # 0 = Fire and forget (Fastest)
+    'bootstrap.servers': '127.0.0.1:9092',
+    'queue.buffering.max.messages': 1000000,
+    'acks': 0,
+    'linger.ms': 5,
+    'compression.type': 'lz4'
 }
 
-producer = Producer(conf)
+def run_diagnostic():
+    print("⚡ [STAGE 1] Initializing Kafka Producer...", flush=True)
+    try:
+        p = Producer(conf)
+    except Exception as e:
+        print(f"❌ KAFKA INIT FAILED: {e}", flush=True)
+        return
 
-SYMBOLS = [f"COIN_{i}" for i in range(100)] # 100 assets
-THREADS = 8 # Matches modern CPU cores
+    print("⚡ [STAGE 2] Testing Protobuf Serialization...", flush=True)
+    try:
+        tick = tick_pb2.Tick()
+        tick.symbol = "BTC"
+        tick.price = 50000.0
+        tick.timestamp = int(time.time() * 1000)
+        payload = tick.SerializeToString()
+        print(f"✅ Protobuf OK. Binary size: {len(payload)} bytes", flush=True)
+    except Exception as e:
+        print(f"❌ PROTOBUF FAILED: {e}", flush=True)
+        print("Check if tick_pb2.py exists and is in the producer folder.", flush=True)
+        return
 
-def stream_market_sector(thread_id, symbols_subset):
+    print("⚡ [STAGE 3] Attempting Single-Tick Production...", flush=True)
+    try:
+        p.produce('crypto-ticks', payload)
+        p.flush(timeout=5)
+        print("✅ Kafka Delivery OK.", flush=True)
+    except Exception as e:
+        print(f"❌ DELIVERY FAILED: {e}", flush=True)
+        return
+
+    print("\n🚀 DIAGNOSTIC PASSED. Starting Turbo Loop (Ctrl+C to stop)...", flush=True)
     count = 0
-    start_time = time.time()
+    start = time.time()
     
     while True:
-        for symbol in symbols_subset:
-            # 1. Create the binary object (Protobuf)
-            tick = tick_pb2.Tick()
-            tick.symbol = symbol
-            tick.price = random.uniform(100, 60000)
-            tick.timestamp = int(time.time() * 1000)
-            
-            # 2. Serialize to Bits
-            payload = tick.SerializeToString()
-            
-            # 3. Fire into Kafka
-            producer.produce('crypto-ticks', payload)
-            count += 1
-            
-            # Periodic flush to clear internal queue
-            if count % 50000 == 0:
-                producer.poll(0) # Non-blocking poll
-                elapsed = time.time() - start_time
-                velocity = int(count / elapsed)
-                print(f"🚀 [Thread {thread_id}] Velocity: {velocity:,} ticks/sec")
+        tick.price = random.uniform(49000, 51000)
+        tick.timestamp = int(time.time() * 1000)
+        p.produce('crypto-ticks', tick.SerializeToString())
+        count += 1
+        
+        if count % 10000 == 0:
+            p.poll(0)
+            elapsed = time.time() - start
+            print(f"🔥 Velocity: {int(count/elapsed):,} t/s | Total: {count:,}", flush=True)
 
-# Distribute 100 symbols across 8 threads
-chunk = len(SYMBOLS) // THREADS
-print(f"🔥 Starting Ingestion Engine: Target 1,000,000 ticks/sec...")
-
-with ThreadPoolExecutor(max_workers=THREADS) as executor:
-    for i in range(THREADS):
-        subset = SYMBOLS[i*chunk : (i+1)*chunk]
-        executor.submit(stream_market_sector, i, subset)
+if __name__ == "__main__":
+    run_diagnostic()
