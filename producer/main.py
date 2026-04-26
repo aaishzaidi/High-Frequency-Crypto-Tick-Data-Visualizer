@@ -1,66 +1,62 @@
-import json
 import time
-import numpy as np
+import random
+import sys
 from confluent_kafka import Producer
+import tick_pb2  # If this fails, it will stop here
 
-# 1. Configure the Kafka connection to point to our Docker container
+# --- PERFORMANCE CONFIG ---
 conf = {
-    'bootstrap.servers': 'localhost:9092',
-    'client.id': 'python-producer',
-    'linger.ms': 10, # Slight delay to batch messages together for network efficiency
-    'batch.num.messages': 10000 
+    'bootstrap.servers': '127.0.0.1:9092',
+    'queue.buffering.max.messages': 1000000,
+    'acks': 0,
+    'linger.ms': 5,
+    'compression.type': 'lz4'
 }
 
-producer = Producer(conf)
-topic = 'crypto-ticks'
+def run_diagnostic():
+    print("⚡ [STAGE 1] Initializing Kafka Producer...", flush=True)
+    try:
+        p = Producer(conf)
+    except Exception as e:
+        print(f"❌ KAFKA INIT FAILED: {e}", flush=True)
+        return
 
-def delivery_report(err, msg):
-    """Callback to silently handle delivery success or print errors."""
-    if err is not None:
-        print(f"Message delivery failed: {err}")
+    print("⚡ [STAGE 2] Testing Protobuf Serialization...", flush=True)
+    try:
+        tick = tick_pb2.Tick()
+        tick.symbol = "BTC"
+        tick.price = 50000.0
+        tick.timestamp = int(time.time() * 1000)
+        payload = tick.SerializeToString()
+        print(f"✅ Protobuf OK. Binary size: {len(payload)} bytes", flush=True)
+    except Exception as e:
+        print(f"❌ PROTOBUF FAILED: {e}", flush=True)
+        print("Check if tick_pb2.py exists and is in the producer folder.", flush=True)
+        return
 
-print("🚀 Starting High-Frequency BTC/USD Generator...")
+    print("⚡ [STAGE 3] Attempting Single-Tick Production...", flush=True)
+    try:
+        p.produce('crypto-ticks', payload)
+        p.flush(timeout=5)
+        print("✅ Kafka Delivery OK.", flush=True)
+    except Exception as e:
+        print(f"❌ DELIVERY FAILED: {e}", flush=True)
+        return
 
-# Starting baseline price for Bitcoin
-current_price = 50000.0
-
-try:
+    print("\n🚀 DIAGNOSTIC PASSED. Starting Turbo Loop (Ctrl+C to stop)...", flush=True)
+    count = 0
+    start = time.time()
+    
     while True:
-        # 2. Use NumPy to instantly generate 10,000 random price movements
-        batch_size = 10000
-        # Create an array of random floats between -2.5 and +2.5
-        price_fluctuations = np.random.uniform(-2.5, 2.5, batch_size) 
+        tick.price = random.uniform(49000, 51000)
+        tick.timestamp = int(time.time() * 1000)
+        p.produce('crypto-ticks', tick.SerializeToString())
+        count += 1
         
-        # Calculate the new prices based on the fluctuations
-        prices = current_price + price_fluctuations
-        base_timestamp = int(time.time() * 1000)
+        if count % 10000 == 0:
+            p.poll(0)
+            elapsed = time.time() - start
+            print(f"🔥 Velocity: {int(count/elapsed):,} t/s | Total: {count:,}", flush=True)
 
-        # 3. Package and shoot them to Kafka
-        for i in range(batch_size):
-            tick = {
-                "symbol": "BTC/USD",
-                "price": round(prices[i], 2),
-                "timestamp": base_timestamp + i 
-            }
-            
-            # Convert JSON to bytes and push to the broker
-            producer.produce(
-                topic, 
-                value=json.dumps(tick).encode('utf-8'), 
-                callback=delivery_report
-            )
-        
-        # 4. Flush the internal queue to the network
-        producer.poll(0)
-        print(f"⚡ Pushed {batch_size} ticks to Kafka...")
-        
-        # We add a tiny 0.1s sleep for testing so it doesn't instantly crash your PC
-        # We will remove this later when we stress test the 1M/sec limit
-        time.sleep(0.1) 
-
-except KeyboardInterrupt:
-    print("\n🛑 Stopping generator...")
-finally:
-    # Ensure all remaining messages in memory are sent before shutting down
-    producer.flush()
-    print("Clean shutdown complete.")
+if __name__ == "__main__":
+    run_diagnostic()

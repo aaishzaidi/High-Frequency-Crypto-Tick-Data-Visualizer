@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+message Tick {
+  string symbol = 1;
+  double price = 2;
+  uint64 timestamp = 3;
+}
