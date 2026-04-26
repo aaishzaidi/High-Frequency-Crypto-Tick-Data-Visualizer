@@ -1,77 +1,98 @@
 const { Kafka } = require('kafkajs');
 const WebSocket = require('ws');
+const protobuf = require('protobufjs');
+const path = require('path');
 
-// --- 1. WebSocket Server Setup ---
-// This opens a port specifically for our React frontend to connect to
-const wss = new WebSocket.Server({ port: 8080 });
-let clients = [];
+// --- 1. CONFIG & STATE ---
+const WS_PORT = 8080;
+const BROADCAST_MS = 100;
+let TickMessage = null;
+let marketSnapshot = {}; 
+let stats = { count: 0, lastLogCount: 0 };
+const startTime = Date.now(); 
 
-wss.on('connection', (ws) => {
-    console.log('🌐 React frontend client connected!');
-    clients.push(ws);
-    
-    ws.on('close', () => {
-        clients = clients.filter(client => client !== ws);
-        console.log('🌐 Frontend client disconnected.');
-    });
-});
-
-// --- 2. Kafka Setup ---
-const kafka = new Kafka({
-  clientId: 'node-relay-server',
-  brokers: ['127.0.0.1:9092'] 
-});
-
-const consumer = kafka.consumer({ groupId: 'crypto-group' });
-
-// --- 3. The Batching Engine ---
-let tickBatch = [];
-const BATCH_INTERVAL_MS = 100; // Send data to frontend every 100ms (10 times per sec)
-
-// This interval loop acts like a heartbeat, flushing the batch to React
-setInterval(() => {
-    if (tickBatch.length > 0 && clients.length > 0) {
-        const payload = JSON.stringify(tickBatch);
-        
-        // Broadcast the batch to all connected web browsers
-        clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(payload);
-            }
-        });
+// --- 2. LOAD PROTOBUF ---
+protobuf.load(path.join(__dirname, "tick.proto"), (err, root) => {
+    if (err) {
+        console.error("❌ PROTOBUF LOAD ERROR:", err);
+        process.exit(1);
     }
-    // Always clear the batch to prevent server memory leaks!
-    tickBatch = []; 
-}, BATCH_INTERVAL_MS);
+    TickMessage = root.lookupType("Tick");
+    console.log("✅ Protobuf Schema Loaded: 'Tick' found.");
+});
 
+// --- 3. WEBSOCKET SERVER ---
+const wss = new WebSocket.Server({ port: WS_PORT });
+let clients = new Set();
+wss.on('connection', (ws) => {
+    clients.add(ws);
+    console.log(`🌐 UI Connected. Total clients: ${clients.size}`);
+    ws.on('close', () => clients.delete(ws));
+});
 
-// --- 4. Kafka Consumer Execution ---
-let messageCount = 0;
+// --- 4. THE DOWNSAMPLER (Fixed negative timeout math) ---
+setInterval(() => {
+    if (clients.size > 0 && Object.keys(marketSnapshot).length > 0) {
+        const payload = JSON.stringify({ 
+            type: 'UPDATE', 
+            data: marketSnapshot, 
+            total: stats.count 
+        });
+        for (let client of clients) {
+            if (client.readyState === WebSocket.OPEN) client.send(payload);
+        }
+    }
+}, BROADCAST_MS);
+
+// --- 5. KAFKA ENGINE ---
+const kafka = new Kafka({ 
+    clientId: 'aggregator-v2', 
+    brokers: ['127.0.0.1:9092'],
+    retry: { initialRetryTime: 100, retries: 8 }
+});
+
+const consumer = kafka.consumer({ groupId: 'bullpen-aggregator-v2' });
 
 const run = async () => {
-  try {
+    console.log("⚡ Connecting to Kafka...");
     await consumer.connect();
-    console.log('🔌 Connected to Kafka successfully.');
-
     await consumer.subscribe({ topic: 'crypto-ticks', fromBeginning: false });
-    console.log('📡 Subscribed to [crypto-ticks]. Waiting for data stream...');
+    
+    console.log("🚀 Aggregator Online. Listening for messages...");
 
     await consumer.run({
-      eachMessage: async ({ topic, partition, message }) => {
-        messageCount++;
-        const tick = JSON.parse(message.value.toString());
-        
-        // Push the new tick into our temporary batch array
-        tickBatch.push(tick);
-        
-        if (messageCount % 10000 === 0) {
-           console.log(`📦 Processed 10,000 ticks. Active WebSockets: ${clients.length}`);
+        eachBatch: async ({ batch }) => {
+            // DEBUG: See if we are getting anything at all
+            if (batch.messages.length > 0) {
+                // console.log(`📦 Received batch of ${batch.messages.length} messages`);
+            }
+
+            for (let message of batch.messages) {
+                if (!TickMessage) continue;
+
+                try {
+                    const tick = TickMessage.decode(message.value);
+                    marketSnapshot[tick.symbol] = { 
+                        p: tick.price.toFixed(2), 
+                        t: tick.timestamp.toString() 
+                    };
+                    stats.count++;
+                } catch (e) {
+                    console.error("❌ Decode Error:", e.message);
+                }
+            }
+
+            // Log every 10,000 ticks instead of 100,000 for faster feedback
+            if (stats.count >= stats.lastLogCount + 10000) {
+                console.log(`📥 Ingested: ${stats.count.toLocaleString()} ticks...`);
+                stats.lastLogCount = stats.count;
+            }
         }
-      },
     });
-  } catch (error) {
-    console.error(`❌ Error connecting to Kafka: ${error}`);
-  }
 };
 
-run().catch(console.error);
+// Keep process alive and catch top-level crashes
+run().catch(err => {
+    console.error("🔥 CRITICAL SERVER CRASH:", err);
+    process.exit(1);
+});

@@ -5,12 +5,13 @@ from confluent_kafka import Producer
 import tick_pb2  # If this fails, it will stop here
 
 # --- PERFORMANCE CONFIG ---
+# Change ONLY this line in your 'conf' dictionary:
 conf = {
     'bootstrap.servers': '127.0.0.1:9092',
+    'compression.type': 'gzip',  # Changed from 'lz4'
     'queue.buffering.max.messages': 1000000,
     'acks': 0,
     'linger.ms': 5,
-    'compression.type': 'lz4'
 }
 
 def run_diagnostic():
