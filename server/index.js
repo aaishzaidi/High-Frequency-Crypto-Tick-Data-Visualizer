@@ -9,7 +9,7 @@ const BROADCAST_MS = 100;
 let TickMessage = null;
 let marketSnapshot = {}; 
 let stats = { count: 0, lastLogCount: 0 };
-const startTime = Date.now(); 
+let isConsumerPaused = false; // The Circuit Breaker Flag
 
 // --- 2. LOAD PROTOBUF ---
 protobuf.load(path.join(__dirname, "tick.proto"), (err, root) => {
@@ -21,16 +21,36 @@ protobuf.load(path.join(__dirname, "tick.proto"), (err, root) => {
     console.log("✅ Protobuf Schema Loaded: 'Tick' found.");
 });
 
-// --- 3. WEBSOCKET SERVER ---
+// --- 3. KAFKA ENGINE SETUP ---
+const kafka = new Kafka({ clientId: 'bullpen-node', brokers: ['127.0.0.1:9092'] });
+const consumer = kafka.consumer({ groupId: 'bullpen-group-' + Date.now() });
+
+// --- 4. WEBSOCKET SERVER (With Circuit Breaker Hook) ---
 const wss = new WebSocket.Server({ port: WS_PORT });
 let clients = new Set();
+
 wss.on('connection', (ws) => {
     clients.add(ws);
     console.log(`🌐 UI Connected. Total clients: ${clients.size}`);
+    
+    // Listen for Kill Switch signals from the React UI
+    ws.on('message', (data) => {
+        const message = JSON.parse(data);
+        if (message.action === 'HALT' && !isConsumerPaused) {
+            console.log("🛑 CIRCUIT BREAKER PULLED: Pausing Kafka Ingestion...");
+            consumer.pause([{ topic: 'crypto-ticks' }]);
+            isConsumerPaused = true;
+        } else if (message.action === 'RESUME' && isConsumerPaused) {
+            console.log("🟢 SYSTEM ONLINE: Resuming Kafka Ingestion...");
+            consumer.resume([{ topic: 'crypto-ticks' }]);
+            isConsumerPaused = false;
+        }
+    });
+
     ws.on('close', () => clients.delete(ws));
 });
 
-// --- 4. THE DOWNSAMPLER (Fixed negative timeout math) ---
+// --- 5. THE DOWNSAMPLER ---
 setInterval(() => {
     if (clients.size > 0 && Object.keys(marketSnapshot).length > 0) {
         const payload = JSON.stringify({ 
@@ -44,28 +64,19 @@ setInterval(() => {
     }
 }, BROADCAST_MS);
 
-// --- 5. KAFKA ENGINE ---
-const kafka = new Kafka({ 
-    clientId: 'aggregator-v2', 
-    brokers: ['127.0.0.1:9092'],
-    retry: { initialRetryTime: 100, retries: 8 }
-});
-
-const consumer = kafka.consumer({ groupId: 'bullpen-aggregator-v2' });
-
+// --- 6. RUN KAFKA CONSUMER ---
 const run = async () => {
     console.log("⚡ Connecting to Kafka...");
     await consumer.connect();
     await consumer.subscribe({ topic: 'crypto-ticks', fromBeginning: false });
     
-    console.log("🚀 Aggregator Online. Listening for messages...");
+    console.log("🚀 Aggregator Online. Ingesting backlog...");
 
     await consumer.run({
+        eachBatchAutoResolve: true,
         eachBatch: async ({ batch }) => {
-            // DEBUG: See if we are getting anything at all
-            if (batch.messages.length > 0) {
-                // console.log(`📦 Received batch of ${batch.messages.length} messages`);
-            }
+            // If the circuit breaker is pulled, skip processing completely
+            if (isConsumerPaused) return;
 
             for (let message of batch.messages) {
                 if (!TickMessage) continue;
@@ -78,20 +89,19 @@ const run = async () => {
                     };
                     stats.count++;
                 } catch (e) {
-                    console.error("❌ Decode Error:", e.message);
+                    // Skip malformed bits quietly
                 }
             }
 
-            // Log every 10,000 ticks instead of 100,000 for faster feedback
-            if (stats.count >= stats.lastLogCount + 10000) {
-                console.log(`📥 Ingested: ${stats.count.toLocaleString()} ticks...`);
+            // Log every 50,000 ticks so the console doesn't lag
+            if (stats.count >= stats.lastLogCount + 50000) {
+                console.log(`📥 Processed: ${stats.count.toLocaleString()} ticks...`);
                 stats.lastLogCount = stats.count;
             }
         }
     });
 };
 
-// Keep process alive and catch top-level crashes
 run().catch(err => {
     console.error("🔥 CRITICAL SERVER CRASH:", err);
     process.exit(1);
